@@ -1,3 +1,8 @@
+-- Configuration
+set InputDirectory to "/Users/jcreid/Downloads/music_test"
+set DiscogsToken to "please_insert_your_own_API_key_here"
+-- you can find your API key at https://www.discogs.com/settings/developers
+
 to ExtractString(AllText, LeftEdge, RightEdge, nthValue)
 	set saveTID to text item delimiters
 	set text item delimiters to LeftEdge
@@ -28,28 +33,46 @@ to replaceText(find, replace, subject)
 	return subject
 end replaceText
 
-to QueryDiscogs(ArtistSong, nthItem)
-
-	set Token to "please_insert_your_own_API_key_here"
-	--	you can find your API key at https://www.discogs.com/settings/developers
-	set baseURL to "\"https://api.discogs.com/database/search?"
-	set AdditionalFilters to "&type=master&format_exact=Single\""
-	set AuthString to " -H \"Authorization: Discogs token=" & Token & "\""
+to QueryDiscogs(ArtistSong)
+	set baseURL to "https://api.discogs.com/database/search?"
+	set AdditionalFilters to "type=master&format_exact=Single"
+	set AuthString to " -H \"Authorization: Discogs token=" & DiscogsToken & "\""
 	set UserAgent to " --user-agent \"CertunaScript/0.1\""
 	set QueryString to "q=" & replaceText(" ", "+", ArtistSong)
-	set curl_command to "curl " & baseURL & QueryString & AdditionalFilters & AuthString & UserAgent
-	set return to do shell script curl_command
+	set curl_command to "curl -s " & baseURL & QueryString & "&" & AdditionalFilters & AuthString & UserAgent
+	set rawResponse to do shell script curl_command
 	delay 0.3 -- do not remove, Discogs rate limits API requests to 60 per minute
-	set return to my replaceText("\"", "", return)
-	set Title to my ExtractString(return, "title: ", ", ", nthItem)
-	set ReleaseYear to my ExtractString(return, "year: ", ", ", nthItem)
-	set Genres to my ExtractString(return, "genre: [", "],", nthItem)
-	set Styles to my ExtractString(return, "style: [", "],", nthItem)
+
+	-- Parse JSON response using shell tools (jq)
+	set parsed to do shell script ("echo '" & rawResponse & "' | jq -r '.results[" & "0" & "] | {title: .title, year: (.year // \"\"), genre: (.genres // [] | join(\", \")), style: (.styles // [] | join(\", \"))} | \"title: \" + .title + \", year: \" + .year + \", genre: [\" + .genre + \"], style: [\" + .style + \"]\"")
+	set Title to my ExtractString(parsed, "title: ", ", ")
+	set ReleaseYear to my ExtractString(parsed, "year: ", ", ")
+	set Genres to my ExtractString(parsed, "genre: [", "],")
+	set Styles to my ExtractString(parsed, "style: [", "],")
 
 	return {Title, ReleaseYear, Genres, Styles}
 
 end QueryDiscogs
 
+to WriteTagsToFile(filePath, ReleaseYear, GenreStringToWrite, CommentText)
+	set commands to ""
+	if ReleaseYear is not "" then
+		set commands to commands & "exiftool -overwrite_original -Year=" & ReleaseYear & " " & quoted form of filePath & " && "
+	end if
+	if GenreStringToWrite is not "" then
+		set commands to commands & "exiftool -overwrite_original -Genre=" & GenreStringToWrite & " " & quoted form of filePath & " && "
+	end if
+	if CommentText is not "" then
+		set commands to commands & "exiftool -overwrite_original -Comment=" & CommentText & " " & quoted form of filePath & " && "
+	end if
+	if commands is not "" then
+		-- Remove trailing " && "
+		set commands to characters 1 thru ((length of commands) - 4) of commands as text
+		do shell script commands
+	end if
+end WriteTagsToFile
+
+-- User configuration dialogs
 set WriteMultipleGenres to true
 set WriteYear to false
 set WriteGenres to false
@@ -70,8 +93,6 @@ if button returned of Question is "Genre" or button returned of Question is "Bot
 	end if
 end if
 
-
-
 set Question to display dialog "Write the Discogs Artist - Title to the Comments field?" buttons {"Yes", "No"} default button 2
 if button returned of Question is "Yes" then
 	set WriteToComments to true
@@ -79,96 +100,119 @@ else
 	set WriteToComments to false
 end if
 
-tell application "Music"
-	--tell application "iTunes" --replace the previous line with this if you're on Mojave or earlier
-	if selection is not {} then
-		set theselectedtracks to selection
-		set FilesCounter to 0
-		set TagsWrittenCounter to 0
-		repeat with thetrack in theselectedtracks
-			set FilesCounter to FilesCounter + 1
-			try
-				set fixed indexing to true
-				set ArtistString to my replaceText("& ", "", (get artist of thetrack))
-				try
-					set ArtistString to first item of my theSplit(ArtistString, " ft ")
-				end try
-				set SongString to (get name of thetrack)
-				try
-					set SongString to first item of my theSplit(SongString, " (")
-				end try
-				set ArtistSong to ArtistString & " " & SongString
+-- Process files from directory instead of Apple Music
+set directoryPath to POSIX file InputDirectory
+set fileItems to list folder directoryPath without invisibles
 
-				set QueryAnswer to my QueryDiscogs(ArtistSong, 1)
-				set ReleaseYear to second item of QueryAnswer
-				set ReleaseGenres to third item of QueryAnswer
-				set ReleaseGenres to my replaceText(", ", ";", ReleaseGenres)
-				set ReleaseStyles to fourth item of QueryAnswer
-				set ReleaseStyles to my replaceText(", ", ";", ReleaseStyles)
+-- Filter to audio files only
+set audioExtensions to {"mp3", "flac", "m4a", "ogg", "wav", "wma", "aiff", "aif"}
+set audioFiles to {}
+repeat with itemName in fileItems
+	set fileExtension to my theSplit(itemName, ".")
+	set ext to last item of fileExtension
+	set extLower to my replaceText(ext, (my replaceText(ext, ext, (do shell script "echo " & quoted form of ext & " | tr A-Z a-z"))) as text, ext)
+	repeat with audioExt in audioExtensions
+		if (my replaceText(ext, ext, (do shell script "echo " & quoted form of ext & " | tr A-Z a-z"))) as text is audioExt then
+			set end of audioFiles to itemName
+			exit repeat
+		end if
+	end repeat
+end repeat
 
-				set ReleaseGenresStyles to ReleaseGenres
-				if ReleaseStyles is not "" then
-					set ReleaseGenresStyles to ReleaseGenresStyles & ";" & ReleaseStyles
+set FilesCounter to 0
+set TagsWrittenCounter to 0
+set ErrorCounter to 0
+
+repeat with fileName in audioFiles
+	set FilesCounter to FilesCounter + 1
+	set filePath to POSIX file (InputDirectory & "/" & fileName) as text
+	try
+		-- Extract artist and title from filename
+		set nameParts to my theSplit(fileName, " - ")
+		if (count of nameParts) >= 2 then
+			set ArtistString to item 1 of nameParts
+			set SongString to my replaceText(" (" & (item 2 of nameParts), "", (item 2 of nameParts))
+		else
+			set ArtistString to ""
+			set SongString to my replaceText(".mp3", "", (my replaceText(".flac", "", (my replaceText(".m4a", "", (my replaceText(".ogg", "", fileName)))))))
+		end if
+
+		-- Clean up artist string
+		set ArtistString to my replaceText("& ", "", ArtistString)
+		try
+			set ArtistString to first item of my theSplit(ArtistString, " ft ")
+		end try
+
+		-- Clean up song string
+		set SongString to first item of my theSplit(SongString, " (")
+		set SongString to first item of my theSplit(SongString, " [")
+
+		set ArtistSong to ArtistString & " " & SongString
+
+		set QueryAnswer to my QueryDiscogs(ArtistSong)
+		set Title to item 1 of QueryAnswer
+		set ReleaseYear to item 2 of QueryAnswer
+		set ReleaseGenres to item 3 of QueryAnswer
+		set ReleaseStyles to item 4 of QueryAnswer
+
+		set ReleaseGenres to my replaceText(", ", ";", ReleaseGenres)
+		set ReleaseStyles to my replaceText(", ", ";", ReleaseStyles)
+
+		set ReleaseGenresStyles to ReleaseGenres
+		if ReleaseStyles is not "" then
+			set ReleaseGenresStyles to ReleaseGenresStyles & ";" & ReleaseStyles
+		end if
+
+		-- Determine genre to write
+		set GenreStringToWrite to ""
+		if ManualGenre is true then
+			if ReleaseGenresStyles contains ";" then
+				set GenreArray to my theSplit(ReleaseGenresStyles, ";")
+			else
+				set GenreArray to {ReleaseGenresStyles}
+			end if
+			if (count of GenreArray) is 1 then
+				set GenreStringToWrite to item 1 of GenreArray
+			else
+				set DialogText to "Choose genre for " & ArtistString & " - " & SongString
+				set buttonList to {}
+				repeat with g in GenreArray
+					set end of buttonList to g
+				end repeat
+				set end of buttonList to "Skip"
+				set GenrePicker to display dialog DialogText buttons buttonList default button 2
+				if button returned of GenrePicker is not "Skip" then
+					set GenreStringToWrite to button returned of GenrePicker
 				end if
-
-				if ManualGenre is true then
-					set DialogText to "Choose genre for " & (get artist of thetrack) & " - " & (get name of thetrack)
-					if ReleaseGenresStyles contains ";" then
-						set GenreArray to my theSplit(ReleaseGenresStyles, ";")
-					else
-						set first item of GenreArray to ReleaseGenresStyles
-					end if
-					if length of GenreArray is 1 then
-						set GenreStringToWrite to first item of GenreArray
-					else
-						if length of GenreArray is 2 then
-							set GenrePicker to display dialog DialogText buttons {first item of GenreArray, second item of GenreArray} default button 2
-						else
-							set GenrePicker to display dialog DialogText buttons {first item of GenreArray, second item of GenreArray, third item of GenreArray} default button 2
-						end if
-						set GenreStringToWrite to button returned of GenrePicker
-					end if
-
+			end if
+		else
+			if WriteMultipleGenres is false then
+				if ReleaseStyles contains ";" then
+					set GenreStringToWrite to first item of theSplit(ReleaseStyles, ";")
 				else
-					if WriteMultipleGenres is false then
-						if ReleaseStyles contains ";" then
-							set GenreStringToWrite to first item of theSplit(ReleaseStyles, ";")
-						else
-							set GenreStringToWrite to ReleaseStyles
-						end if
-					else
-						set GenreStringToWrite to ReleaseGenresStyles
-
-					end if
+					set GenreStringToWrite to ReleaseStyles
 				end if
+			else
+				set GenreStringToWrite to ReleaseGenresStyles
+			end if
+		end if
 
+		-- Build comment text
+		set CommentText to ""
+		if WriteToComments is true and Title is not "" then
+			set CommentText to Title
+		end if
 
-				set frontmost to true
-				tell thetrack
-					set YearWritten to false
-					set GenresWritten to false
-					if ReleaseYear is not "" and WriteYear is true then
-						set year to ReleaseYear
-						set YearWritten to true
-					end if
-					if GenreStringToWrite is not "" and WriteGenres is true then
-						set genre to GenreStringToWrite
-						set GenresWritten to true
-					end if
-					if YearWritten is true or GenresWritten is true then
-						set TagsWrittenCounter to TagsWrittenCounter + 1
-						if WriteToComments is true then
-							if comment = "" then
-								set comment to first item of QueryAnswer
-							else
-								set comment to comment & ";" & first item of QueryAnswer
-							end if
-						end if
-					end if
-				end tell
-			end try
-		end repeat
-		set DialogText to "Done: " & TagsWrittenCounter & " tags written"
-		display dialog DialogText buttons {"ok"}
-	end if
-end tell
+		-- Write tags to file
+		if ReleaseYear is not "" or GenreStringToWrite is not "" or CommentText is not "" then
+			my WriteTagsToFile(filePath, ReleaseYear, GenreStringToWrite, CommentText)
+			set TagsWrittenCounter to TagsWrittenCounter + 1
+		end if
+
+	on error errMsg
+		set ErrorCounter to ErrorCounter + 1
+	end try
+end repeat
+
+set DialogText to "Done: " & TagsWrittenCounter & " tags written" & return & "Errors: " & ErrorCounter & " of " & FilesCounter & " files"
+display dialog DialogText buttons {"ok"} default button 1
